@@ -1,0 +1,287 @@
+---
+title: "Day 17: Bagging and Random Forests — In-Class Activity"
+subtitle: "Does this suburb have a high crime rate? Let 500 trees vote."
+author: "Econ 122"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r packages, include=FALSE, eval=TRUE}
+mypacks <- c("ggplot2","dplyr","ISLR2","rpart","rpart.plot","randomForest")
+packs <- installed.packages()
+install.me <- mypacks[!(mypacks %in% packs[,"Package"])]
+if (length(install.me) >= 1) install.packages(install.me, repos = "http://cran.us.r-project.org")
+lapply(mypacks, library, character.only=TRUE)
+```
+
+## Introduction
+
+New data today: `Boston` (ISLR2), 506 suburbs of Boston in the 1970s. The
+question (ISL exercise 4.16): **does a suburb have a crime rate above the
+median?**
+
+| Variable | Meaning |
+|---|---|
+| `HighCrime` | `Yes` if the crime rate per person is above the median |
+| `nox` | air pollution: nitrogen oxides (parts per 10 million) |
+| `indus` | share of land used by industry (percent) |
+| `age` | share of homes built before 1940 (percent) |
+| `dis` | distance to Boston's main employment centers |
+| `rad` | access to radial highways, an index from 1 to 24 (24 = central Boston) |
+| `tax` | property tax rate |
+| `ptratio`, `lstat`, `medv`, `rm`, `zn`, `chas` | pupils per teacher, share of lower-status residents, median home value, rooms per home, share of large residential lots, next to the Charles River |
+
+Today you'll compare four methods on this question: logistic regression, one
+tree, bagging, and a random forest. You'll find out which ones do better,
+**why**, and **by how much**.
+
+**All the code is written for you today.** Your job is to explain what it
+shows.
+
+- **Predict** questions come before a chunk. Write your guess *before* you
+  run it, and don't change it afterward. A wrong guess is fine; it's often
+  the most useful one.
+- The questions in *italics* come after a chunk. Answer them in a few
+  sentences, in your own words, and point to **specific numbers or places in
+  your output**.
+
+**Estimated time: 25 minutes.** The goal for today is **Parts 1–3**. If you
+finish them, keep going with the **Bonus** section at the end. If you don't
+reach the Bonus, that's completely fine.
+
+```{r load}
+data(Boston)
+boston <- Boston %>%
+  mutate(HighCrime = factor(if_else(crim > median(crim), "Yes", "No"))) %>%
+  select(-crim)
+```
+
+---
+
+## Part 1: A Shape a Straight Line Can't Draw (6 minutes)
+
+### Task 1.1: Look at two predictors
+
+**Predict:** as highway access (`rad`) goes from 1 to 24, what happens to
+the share of high-crime suburbs?
+
+Run this chunk. (`rad` only takes a few values, so the points are jittered
+sideways a little to keep them from piling up.)
+
+```{r task1_1, fig.height=3.5}
+ggplot(boston, aes(rad, nox, color = HighCrime)) +
+  geom_jitter(width = 0.3, height = 0) +
+  scale_color_manual(values = c(No = "grey60", Yes = "darkorange")) +
+  labs(x = "Highway access index (rad)", y = "Air pollution (nox)")
+
+boston %>%
+  group_by(rad) %>%
+  summarise(suburbs = n(), share_high_crime = mean(HighCrime == "Yes"))
+```
+
+*Was your prediction right? Name a value of `rad` where the pattern breaks.
+How does `nox` relate to crime?*
+
+### Task 1.2: One tree vs logistic regression
+
+This chunk fits a tree and a logistic regression on `nox` and `rad`, and
+shades the plot by each one's prediction. Run it.
+
+```{r task1_2, fig.width=10, fig.height=3.5}
+tree2 <- rpart(HighCrime ~ nox + rad, data = boston, method = "class")
+logit2 <- glm(HighCrime ~ nox + rad, data = boston, family = binomial)
+
+grid <- expand.grid(rad = seq(1, 24, by = 0.1), nox = seq(0.38, 0.88, by = 0.005))
+grid_pred <- bind_rows(
+  grid %>% mutate(model = "Logistic regression",
+                  pred = if_else(predict(logit2, grid, type = "response") > 0.5, "Yes", "No")),
+  grid %>% mutate(model = "One tree",
+                  pred = as.character(predict(tree2, grid, type = "class")))
+)
+ggplot(grid_pred, aes(rad, nox)) +
+  geom_raster(aes(fill = pred), alpha = 0.3) +
+  geom_jitter(data = boston, aes(color = HighCrime), width = 0.3, height = 0, size = 0.8) +
+  facet_wrap(~ model) +
+  scale_fill_manual(values = c(No = "grey60", Yes = "darkorange")) +
+  scale_color_manual(values = c(No = "grey40", Yes = "darkorange3")) +
+  labs(x = "Highway access index (rad)", y = "Air pollution (nox)",
+       fill = "Predicted", color = "Actual")
+```
+
+```{r task1_2_tree, fig.width=9, fig.height=5.5}
+rpart.plot(tree2, type = 2, extra = 106, tweak = 1.2)   # each question is under its box; "yes" goes left
+```
+
+*Write the tree's first three questions as a rule in words. In the two
+shaded plots, find a group of suburbs that the tree gets right and logistic
+regression gets wrong: give their rough `rad` and `nox`. Why can't a
+straight line get them right without getting their neighbors wrong? (Use
+Task 1.1.)*
+
+---
+
+## Part 2: Many Trees (7 minutes)
+
+### Task 2.1: Bagging and a random forest
+
+Now use **all 12 predictors**. Bagging lets every split choose from all 12;
+a random forest lets each split choose from only `mtry` predictors drawn at
+random (default: √12 rounded down, 3).
+
+**Predict:** both methods vote with 500 trees. Which will have the lower
+OOB error, and by about how much?
+
+```{r task2_1}
+set.seed(17)
+bag <- randomForest(HighCrime ~ ., data = boston, ntree = 500, mtry = 12)
+set.seed(17)
+forest <- randomForest(HighCrime ~ ., data = boston, ntree = 500, importance = TRUE)
+
+bag$err.rate[500, "OOB"]      # OOB error, bagging
+forest$err.rate[500, "OOB"]   # OOB error, random forest
+```
+
+*Was your prediction right? One suburb is 0.2 points of error (1/506): how
+many suburbs is the difference?*
+
+### Task 2.2: What do the trees ask first?
+
+**Predict:** which predictor do you think most of the bagged trees ask about
+first? (Look back at the tree in Task 1.2.)
+
+This chunk counts each tree's first question, and shows how alike some of
+the predictors are.
+
+```{r task2_2}
+first_question <- function(rf) {
+  sapply(1:rf$ntree, function(k) as.character(getTree(rf, k, labelVar = TRUE)[1, "split var"]))
+}
+sort(table(first_question(bag)), decreasing = TRUE)
+sort(table(first_question(forest)), decreasing = TRUE)
+
+round(cor(boston[, c("nox", "indus", "age", "dis", "rad", "tax")]), 2)
+```
+
+*How many of the 500 bagged trees start with the same question, and how many
+of the forest's trees? What do `nox`, `indus`, `age`, `dis`, and `tax` have
+in common?*
+
+*Now explain, to a friend who hasn't taken this class, why the random forest
+votes better than bagging. Don't use the words "variance", "correlated", or
+"decorrelate".*
+
+---
+
+## Part 3: The Scoreboard (12 minutes)
+
+### Task 3.1: Choosing `mtry` with OOB error
+
+This chunk fits forests with `mtry` from 1 (each split sees one random
+predictor) to 12 (bagging), each with three different seeds.
+
+**Predict:** which will do **worst**: `mtry` = 1, 3, or 12? Why?
+
+```{r task3_1}
+mtrys <- c(1, 2, 3, 4, 6, 9, 12)
+oob <- matrix(NA, nrow = length(mtrys), ncol = 3,
+              dimnames = list(NULL, c("seed_1", "seed_2", "seed_3")))
+for (i in 1:length(mtrys)) {
+  for (s in 1:3) {
+    set.seed(s)
+    fit <- randomForest(HighCrime ~ ., data = boston, ntree = 500, mtry = mtrys[i])
+    oob[i, s] <- fit$err.rate[500, "OOB"]
+  }
+}
+tibble(mtry = mtrys, as_tibble(oob))
+```
+
+*Which `mtry` values do best? Is bagging (`mtry` = 12) worse with all three
+seeds? Why might `mtry` = 1 be too few?*
+
+### Task 3.2: All four methods, on three sets of folds
+
+To compare all four methods on equal terms, this chunk runs 5-fold CV, and
+repeats it with three different random fold assignments. (It takes about 15
+seconds.)
+
+**Predict:** rank the four methods from worst to best.
+
+```{r task3_2}
+methods <- c("logistic", "one tree", "bagging", "random forest")
+cv_error <- matrix(NA, nrow = 3, ncol = 4, dimnames = list(paste("folds", 1:3), methods))
+for (s in 1:3) {
+  set.seed(s)
+  fold <- sample(rep(1:5, length.out = nrow(boston)))
+  errors <- matrix(NA, nrow = 5, ncol = 4, dimnames = list(NULL, methods))
+  for (f in 1:5) {
+    train <- boston[fold != f, ]
+    test  <- boston[fold == f, ]
+
+    logit <- glm(HighCrime ~ ., data = train, family = binomial)
+    p <- predict(logit, test, type = "response")
+    errors[f, "logistic"] <- mean(if_else(p > 0.5, "Yes", "No") != test$HighCrime)
+
+    tree <- rpart(HighCrime ~ ., data = train, method = "class")
+    errors[f, "one tree"] <- mean(predict(tree, test, type = "class") != test$HighCrime)
+
+    set.seed(f)
+    bag_f <- randomForest(HighCrime ~ ., data = train, ntree = 500, mtry = 12)
+    errors[f, "bagging"] <- mean(predict(bag_f, test) != test$HighCrime)
+
+    set.seed(f)
+    rf_f <- randomForest(HighCrime ~ ., data = train, ntree = 500)
+    errors[f, "random forest"] <- mean(predict(rf_f, test) != test$HighCrime)
+  }
+  cv_error[s, ] <- colMeans(errors)
+}
+cv_error                # one row per set of folds
+colMeans(cv_error)      # averaged over the three
+```
+
+*How did your ranking do? For each step (logistic → tree, tree → bagging,
+bagging → forest), give the gain in points and explain it in one sentence,
+using Part 1 or Part 2. Which step is worth the most?*
+
+*A classmate says: "The forest only beats bagging by about a point. That's
+just luck." Use the three rows of `cv_error` to answer them.*
+
+---
+
+## Bonus (optional)
+
+Work on these if you finish the main questions.
+
+### Bonus 1: Tell logistic regression the shape
+
+Part 1 showed that `rad` is an index whose effect jumps around, but logistic
+regression treats it as a number with one steady slope. Treat it as
+categories instead: change the logistic formula in Task 3.2 to
+`HighCrime ~ . - rad + factor(rad)` and rerun it.
+
+*How much does logistic regression improve? Does it catch the forest? What
+did the trees do that we had to do by hand?*
+
+### Bonus 2: Which predictors matter?
+
+```{r bonus2}
+imp <- importance(forest, type = 1, scale = FALSE)
+tibble(predictor = rownames(imp), accuracy_lost = imp[, 1]) %>%
+  arrange(desc(accuracy_lost))
+```
+
+*Which predictors matter most? Does the table say whether more pollution
+means more or less crime?*
+
+### Bonus 3: Back to the colleges
+
+The same comparison on Days 12–16's colleges (is a college private? all 17
+predictors) gives: logistic regression 6.2%, one tree 8.5%, random forest
+5.8%, each with an SE of about 1 point. There one tree is **worse** than
+logistic regression, and the forest only ties it.
+
+*Why might trees help so much for crime in Boston's suburbs but not for
+private vs public colleges? (Think back to Part 1: what shape does each
+boundary have?)*
